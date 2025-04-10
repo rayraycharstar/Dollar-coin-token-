@@ -32,4 +32,6 @@ https://{
 </div>
 
 <h2>Be Part of the Legacy</h2>
-<p>Let’s make this count. Share this story, hold the token, and help keep this dream alive. DCTK isn’t about money—it’s about purpose.</p>https://chatgpt.com/canvas/shared/67f7670578f08191b33c08748ce41510https://unisat.io/brc20/dctk
+<p>Let’s make this count. Share this story, hold the token, and help keep this dream alive. DCTK isn’t about money—it’s about purpose.</p>https://chatgpt.com/canvas/shared/67f7670578f08191b33c08748ce41510
+https://unisat.io/brc20/dctk
+https://Dollar-coin-token.com

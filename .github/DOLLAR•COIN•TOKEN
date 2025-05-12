@@ -1,0 +1,739 @@
+const express = require('express');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const axios = require('axios');
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
+const cors = require('cors');
+const csrf = require('csurf');
+const cookieParser = require('cookie-parser');
+const sanitizeHtml = require('sanitize-html');
+const crypto = require('crypto');
+const winston = require('winston');
+
+// Logger Setup
+const logger = winston.createLogger({
+    level: 'info',
+    format: winston.format.combine(
+        winston.format.timestamp(),
+        winston.format.json()
+    ),
+    transports: [
+        new winston.transports.File({ filename: 'error.log', level: 'error' }),
+        new winston.transports.File({ filename: 'combined.log' }),
+        new winston.transports.Console()
+    ]
+});
+
+const app = express();
+
+// HTTPS Setup (Let’s Encrypt certificates for production)
+const options = {
+    key: fs.readFileSync('/etc/letsencrypt/live/dcdollarcoin.u/privkey.pem'),
+    cert: fs.readFileSync('/etc/letsencrypt/live/dcdollarcoin.u/cert.pem'),
+    ca: fs.readFileSync('/etc/letsencrypt/live/dcdollarcoin.u/chain.pem')
+};
+
+// Middleware
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
+app.use(helmet({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+            scriptSrc: ["'self'", "https://unpkg.com"],
+            connectSrc: ["'self'", "https://dcdollarcoin.u:3000", "wss://relay.walletconnect.com", "https://relay.walletconnect.com"]
+        }
+    }
+}));
+app.use(cors({
+    origin: ['https://dcdollarcoin.u', 'https://relay.walletconnect.com'],
+    credentials: true
+}));
+
+// Global Rate Limiting (DDoS Protection)
+const globalRateLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 1000, // 1000 requests per IP
+    message: 'Too many requests from this IP, please try again later.'
+});
+app.use(globalRateLimiter);
+
+// OKX-specific Rate Limiting (20 requests/second)
+const okxRateLimiter = rateLimit({
+    windowMs: 1000, // 1 second
+    max: 20, // 20 requests per second
+    message: 'Rate limit exceeded for OKX API. Please try again later.'
+});
+
+// CSRF Protection
+const csrfProtection = csrf({ cookie: { httpOnly: true, secure: true, sameSite: 'Strict' } });
+app.use(csrfProtection);
+
+// API Configs (Replace with your actual keys)
+const MAGIC_EDEN_API_KEY = 'YOUR_MAGIC_EDEN_API_KEY';
+const OKX_API_KEY = 'YOUR_OKX_API_KEY';
+const OKX_API_SECRET = 'YOUR_OKX_API_SECRET';
+const OKX_PASSPHRASE = 'YOUR_OKX_PASSPHRASE';
+const MAGIC_EDEN_BASE_URL = 'https://api.magiceden.io';
+const OKX_BASE_URL = 'https://www.okx.com';
+
+// Security Firewall Middleware
+const firewallMiddleware = (req, res, next) => {
+    const ip = req.ip;
+    const userAgent = req.headers['user-agent'] || '';
+    const blockedAgents = ['bot', 'spider', 'crawler', 'python-requests'];
+
+    if (blockedAgents.some(agent => userAgent.toLowerCase().includes(agent))) {
+        logger.warn(`Blocked IP ${ip}, Agent: ${userAgent}`);
+        return res.status(403).json({ error: 'Access denied: Suspicious user agent detected' });
+    }
+
+    if (!userAgent || userAgent.length > 500) {
+        logger.warn(`Blocked IP ${ip}, Invalid User-Agent: ${userAgent}`);
+        return res.status(403).json({ error: 'Access denied: Invalid user agent' });
+    }
+
+    logger.info(`Request from IP: ${ip}, User-Agent: ${userAgent}`);
+    next();
+};
+app.use(firewallMiddleware);
+
+// Input Sanitization Middleware
+const sanitizeInput = (req, res, next) => {
+    if (req.body) {
+        Object.keys(req.body).forEach(key => {
+            if (typeof req.body[key] === 'string') {
+                req.body[key] = sanitizeHtml(req.body[key], {
+                    allowedTags: [],
+                    allowedAttributes: {}
+                });
+            }
+        });
+    }
+    next();
+};
+app.use(sanitizeInput);
+
+// Error Handling Middleware
+app.use((err, req, res, next) => {
+    logger.error(`Error: ${err.message}, Stack: ${err.stack}`);
+    if (err.code === 'EBADCSRFTOKEN') {
+        return res.status(403).json({ error: 'Invalid CSRF token' });
+    }
+    res.status(500).json({ error: 'Internal server error' });
+});
+
+// Routes
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// Magic Eden Runes Prices
+app.get('/magic-eden/runes/prices', async (req, res) => {
+    try {
+        const response = await axios.get(`${MAGIC_EDEN_BASE_URL}/runes/prices`, {
+            headers: { 'Authorization': `Bearer ${MAGIC_EDEN_API_KEY}` },
+            timeout: 5000
+        });
+        res.json(response.data);
+    } catch (error) {
+        logger.error(`Magic Eden Price Error: ${error.message}`);
+        res.status(500).json({ error: 'Error fetching Runes prices.' });
+    }
+});
+
+// Magic Eden Trade
+app.post('/magic-eden/runes/trade', csrfProtection, async (req, res) => {
+    const { tokenSymbol, amount, side, address } = req.body;
+
+    if (!tokenSymbol || !amount || !side || !address) {
+        return res.status(400).json({ error: 'Missing required fields' });
+    }
+    if (isNaN(amount) || amount <= 0) {
+        return res.status(400).json({ error: 'Amount must be a positive number' });
+    }
+    if (!['buy', 'sell'].includes(side)) {
+        return res.status(400).json({ error: 'Side must be "buy" or "sell"' });
+    }
+
+    try {
+        const response = {
+            status: 'success',
+            orderId: `mock-order-${Date.now()}`,
+            message: `Mock trade: ${side} ${amount} ${tokenSymbol} to ${address}`
+        };
+        res.json(response);
+    } catch (error) {
+        logger.error(`Magic Eden Trade Error: ${error.message}`);
+        res.status(500).json({ error: 'Failed to execute trade' });
+    }
+});
+
+// OKX BRC-20 Prices
+app.get('/okx/brc20/prices', okxRateLimiter, async (req, res) => {
+    try {
+        const response = await axios.get(`${OKX_BASE_URL}/api/v5/public/ticker?instType=SPOT`, {
+            timeout: 5000
+        });
+        res.json(response.data);
+    } catch (error) {
+        logger.error(`OKX Price Error: ${error.message}`);
+        res.status(500).json({ error: 'Error fetching BRC-20 prices.' });
+    }
+});
+
+// OKX Trade
+app.post('/okx/trade', okxRateLimiter, csrfProtection, async (req, res) => {
+    const { tokenSymbol, amount, side } = req.body;
+
+    if (!tokenSymbol || !amount || !side) {
+        return res.status(400).json({ error: 'Missing required fields' });
+    }
+    if (isNaN(amount) || amount <= 0) {
+        return res.status(400).json({ error: 'Amount must be a positive number' });
+    }
+    if (!['buy', 'sell'].includes(side)) {
+        return res.status(400).json({ error: 'Side must be "buy" or "sell"' });
+    }
+
+    const path = '/api/v5/trade/order';
+    const body = JSON.stringify({
+        instId: `${tokenSymbol}-BTC`,
+        tdMode: 'cash',
+        side: side,
+        ordType: 'market',
+        sz: amount.toString()
+    });
+
+    try {
+        const timestamp = new Date().toISOString();
+        const message = `${timestamp}POST${path}${body}`;
+        const signature = crypto.createHmac('sha256', OKX_API_SECRET).update(message).digest('base64');
+
+        const response = await axios.post(`${OKX_BASE_URL}${path}`, body, {
+            headers: {
+                'OK-ACCESS-KEY': OKX_API_KEY,
+                'OK-ACCESS-SIGN': signature,
+                'OK-ACCESS-TIMESTAMP': timestamp,
+                'OK-ACCESS-PASSPHRASE': OKX_PASSPHRASE,
+                'Content-Type': 'application/json'
+            },
+            timeout: 5000
+        });
+
+        res.json(response.data);
+    } catch (error) {
+        logger.error(`OKX Trade Error: ${error.message}`);
+        res.status(500).json({ error: 'Failed to execute trade' });
+    }
+});
+
+// Serve static files
+app.use(express.static(path.join(__dirname, 'public')));
+
+// Start server with HTTPS
+https.createServer(options, app).listen(3000, () => {
+    logger.info('Server running securely on https://dcdollarcoin.u:3000');
+});<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Explore, trade, and mint Runes and BRC-20 tokens on DC Dollar Coin. Learn about the Runes protocol and simplify transactions with Unisat and OKX wallets.">
+    <meta name="keywords" content="Runes, BRC-20, DC Dollar Coin, token trading, Unisat, OKX, cryptocurrency, Bitcoin tokens">
+    <meta name="author" content="DC Dollar Coin Team">
+    <meta property="og:title" content="DC Dollar Coin - Runes & BRC-20 Tokens">
+    <meta property="og:description" content="Trade and mint Runes and BRC-20 tokens with ease. Learn about the Runes protocol and connect with Unisat/OKX wallets.">
+    <meta property="og:image" content="https://dcdollarcoin.u/og-image.jpg">
+    <meta property="og:url" content="https://dcdollarcoin.u">
+    <title>DC Dollar Coin - Trading Dashboard</title>
+    <link rel="stylesheet" href="styles.css">
+    <!-- WalletConnect Modal Styles -->
+    <link href="https://unpkg.com/@walletconnect/modal@2.6.2/dist/index.css" rel="stylesheet">
+</head>
+<body>
+    <div class="container">
+        <header class="header">
+            <h1>DC Dollar Coin</h1>
+            <div class="wallet-section">
+                <button id="connectWalletBtn" class="connect-btn">Connect Wallet</button>
+                <span id="walletAddress" class="wallet-address"></span>
+                <button id="disconnectWalletBtn" class="disconnect-btn" style="display: none;">Disconnect</button>
+            </div>
+        </header>
+
+        <section class="prices-section">
+            <h2>Prices</h2>
+            <button onclick="fetchPrices()" class="refresh-btn">Refresh Prices</button>
+            <div id="magic-eden-listings" class="output-box"></div>
+            <div id="okx-trades" class="output-box"></div>
+        </section>
+
+        <section class="trade-section">
+            <h2>Trade (Mock / Live)</h2>
+            <form id="tradeForm">
+                <input type="hidden" name="_csrf" id="csrfToken">
+                <label>Token Symbol:
+                    <input type="text" name="tokenSymbol" required placeholder="e.g., RUNES•COIN•TOKEN">
+                </label>
+                <label>Amount:
+                    <input type="number" name="amount" required min="1" step="1" placeholder="Enter amount">
+                </label>
+                <label>Side:
+                    <select name="side">
+                        <option value="buy">Buy</option>
+                        <option value="sell">Sell</option>
+                    </select>
+                </label>
+                <label>Address (Auto-filled if wallet connected):
+                    <input type="text" name="address" id="tradeAddress" placeholder="Your wallet address" readonly>
+                </label>
+                <label>Platform:
+                    <select name="platform">
+                        <option value="magiceden">Magic Eden (Runes)</option>
+                        <option value="okx">OKX (BRC-20)</option>
+                    </select>
+                </label>
+                <button type="submit" class="submit-btn">Submit Trade</button>
+            </form>
+            <pre id="tradeResult" class="output-box"></pre>
+        </section>
+    </div>
+
+    <!-- WalletConnect Scripts -->
+    <script src="https://unpkg.com/@walletconnect/sign-client@2.14.2/dist/index.js"></script>
+    <script src="https://unpkg.com/@walletconnect/modal@2.6.2/dist/index.js"></script>
+    <script src="script.js"></script>
+</body>
+</html>body {
+    font-family: 'Arial', sans-serif;
+    background: #1a1a1a; /* Black background */
+    color: #fff; /* White text */
+    margin: 0;
+    padding: 20px;
+    overflow-x: hidden;
+}
+
+.container {
+    max-width: 800px;
+    margin: auto;
+    padding: 30px;
+    background: #222; /* Dark gray container */
+    border-radius: 15px;
+    box-shadow: 0 8px 20px rgba(0, 0, 0, 0.7);
+    animation: fadeIn 1s ease-in-out;
+}
+
+.header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 2px solid #d4af37; /* Gold border */
+    padding-bottom: 15px;
+    margin-bottom: 30px;
+}
+
+h1 {
+    color: #d4af37; /* Gold color */
+    font-size: 2.5rem;
+    margin: 0;
+    text-shadow: 0 2px 5px rgba(0, 0, 0, 0.5);
+}
+
+.wallet-section {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.connect-btn, .disconnect-btn {
+    padding: 8px 20px;
+    border-radius: 25px;
+    border: none;
+    background: #d4af37; /* Gold button */
+    color: #000;
+    font-weight: bold;
+    cursor: pointer;
+    transition: transform 0.2s, background 0.3s;
+}
+
+.connect-btn:hover, .disconnect-btn:hover {
+    background: #b8972f; /* Darker gold */
+    transform: scale(1.05);
+}
+
+.disconnect-btn {
+    background: #ff0000; /* Red button */
+}
+
+.disconnect-btn:hover {
+    background: #cc0000; /* Darker red */
+}
+
+.wallet-address {
+    color: #d4af37;
+    font-size: 0.9rem;
+    max-width: 150px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+h2 {
+    color: #ff0000; /* Red color */
+    font-size: 1.8rem;
+    margin-top: 30px;
+    margin-bottom: 15px;
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+}
+
+label {
+    display: block;
+    margin: 15px 0 5px;
+    font-size: 1rem;
+}
+
+input, select {
+    width: 100%;
+    padding: 12px;
+    margin-top: 5px;
+    border-radius: 8px;
+    border: 1px solid #444;
+    background: #333;
+    color: #fff;
+    font-size: 1rem;
+    box-sizing: border-box;
+    transition: border-color 0.3s, box-shadow 0.3s;
+}
+
+input:focus, select:focus {
+    outline: none;
+    border-color: #d4af37; /* Gold border on focus */
+    box-shadow: 0 0 8px rgba(212, 175, 55, 0.3);
+}
+
+button {
+    width: 100%;
+    padding: 12px;
+    margin-top: 15px;
+    border-radius: 8px;
+    border: none;
+    background: #d4af37; /* Gold button */
+    color: #000;
+    font-weight: bold;
+    cursor: pointer;
+    transition: transform 0.2s, background 0.3s;
+}
+
+button:hover {
+    background: #b8972f; /* Darker gold */
+    transform: scale(1.02);
+}
+
+.refresh-btn {
+    width: auto;
+    padding: 10px 25px;
+    display: inline-block;
+}
+
+.submit-btn {
+    background: #ff0000; /* Red submit button */
+}
+
+.submit-btn:hover {
+    background: #cc0000; /* Darker red */
+}
+
+.output-box {
+    background: #000;
+    padding: 20px;
+    border-radius: 10px;
+    margin-top: 15px;
+    font-family: monospace;
+    white-space: pre-wrap;
+    min-height: 100px;
+    border: 1px solid #444;
+    box-shadow: inset 0 2px 5px rgba(0, 0, 0, 0.5);
+}
+
+.prices-section, .trade-section {
+    animation: slideIn 0.8s ease-in-out;
+}
+
+/* Animations */
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(-20px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes slideIn {
+    from { opacity: 0; transform: translateX(-20px); }
+    to { opacity: 1; transform: translateX(0); }
+}
+
+/* Responsive Design */
+@media (max-width: 600px) {
+    .container {
+        padding: 20px;
+    }
+
+    h1 {
+        font-size: 2rem;
+    }
+
+    h2 {
+        font-size: 1.5rem;
+    }
+
+    .header {
+        flex-direction: column;
+        gap: 15px;
+    }
+
+    .wallet-section {
+        flex-direction: column;
+        align-items: flex-start;
+    }
+
+    label, input, select, button {
+        font-size: 0.9rem;
+    }
+
+    .connect-btn, .disconnect-btn {
+        width: 100%;
+    }
+}// WalletConnect Setup
+const walletConnectModal = new WalletConnectModal({
+    projectId: 'YOUR_WALLET_CONNECT_PROJECT_ID', // Replace with your WalletConnect Project ID
+    themeMode: 'dark',
+    themeVariables: {
+        '--wcm-accent-color': '#d4af37', // Gold color
+        '--wcm-background-color': '#222',
+        '--wcm-text-color': '#fff'
+    }
+});
+
+let signClient;
+let walletAddress = null;
+
+// Initialize WalletConnect
+async function initializeWalletConnect() {
+    try {
+        signClient = await SignClient.init({
+            projectId: 'YOUR_WALLET_CONNECT_PROJECT_ID', // Replace with your WalletConnect Project ID
+            metadata: {
+                name: 'DC Dollar Coin',
+                description: 'Trade Runes and BRC-20 tokens',
+                url: 'https://dcdollarcoin.u',
+                icons: ['https://dcdollarcoin.u/icon.png']
+            }
+        });
+
+        // Handle session events
+        signClient.on('session_delete', () => {
+            disconnectWallet();
+        });
+
+        signClient.on('session_expire', () => {
+            disconnectWallet();
+            document.getElementById('tradeResult').innerText = 'Wallet session expired. Please reconnect.';
+        });
+
+        // Restore previous session if exists
+        const lastSession = signClient.session.getAll().slice(-1)[0];
+        if (lastSession) {
+            walletAddress = lastSession.namespaces.bitcoin.accounts[0].split(':')[2];
+            updateWalletUI();
+        }
+    } catch (err) {
+        console.error('WalletConnect Init Error:', err.message);
+        document.getElementById('tradeResult').innerText = 'Error initializing WalletConnect: ' + err.message;
+    }
+}
+
+// Connect Wallet
+async function connectWallet() {
+    try {
+        const { uri, approval } = await signClient.connect({
+            requiredNamespaces: {
+                bitcoin: {
+                    methods: ['bitcoin_signMessage', 'bitcoin_getAccounts'],
+                    chains: ['bitcoin:1'],
+                    events: ['accountsChanged']
+                }
+            }
+        });
+
+        if (uri) {
+            await walletConnectModal.openModal({ uri });
+            const session = await approval();
+            walletAddress = session.namespaces.bitcoin.accounts[0].split(':')[2];
+            updateWalletUI();
+            walletConnectModal.closeModal();
+        }
+    } catch (err) {
+        console.error('Wallet Connect Error:', err.message);
+        document.getElementById('tradeResult').innerText = 'Failed to connect wallet: ' + err.message;
+    }
+}
+
+// Disconnect Wallet
+function disconnectWallet() {
+    walletAddress = null;
+    updateWalletUI();
+    signClient.session.getAll().forEach(session => signClient.disconnect({ topic: session.topic }));
+}
+
+// Update Wallet UI
+function updateWalletUI() {
+    const connectBtn = document.getElementById('connectWalletBtn');
+    const disconnectBtn = document.getElementById('disconnectWalletBtn');
+    const walletAddressSpan = document.getElementById('walletAddress');
+    const tradeAddressInput = document.getElementById('tradeAddress');
+
+    if (walletAddress) {
+        connectBtn.style.display = 'none';
+        disconnectBtn.style.display = 'inline-block';
+        walletAddressSpan.innerText = `Connected: ${walletAddress}`;
+        tradeAddressInput.value = walletAddress;
+        tradeAddressInput.readOnly = true;
+    } else {
+        connectBtn.style.display = 'inline-block';
+        disconnectBtn.style.display = 'none';
+        walletAddressSpan.innerText = '';
+        tradeAddressInput.value = '';
+        tradeAddressInput.readOnly = false;
+    }
+}
+
+// Sanitize inputs to prevent XSS
+function sanitizeInput(value) {
+    return value.replace(/[<>&"'/]/g, char => ({
+        '<': '<',
+        '>': '>',
+        '&': '&',
+        '"': '"',
+        "'": ''',
+        '/': '/'
+    }[char]));
+}
+
+// Fetch CSRF Token
+async function fetchCSRFToken() {
+    try {
+        const response = await fetch('https://dcdollarcoin.u:3000/magic-eden/runes/prices', {
+            credentials: 'include'
+        });
+        if (!response.ok) throw new Error('Failed to fetch CSRF token');
+        const cookies = document.cookie.split(';').find(cookie => cookie.trim().startsWith('csrfToken='));
+        const token = cookies ? cookies.split('=')[1] : '';
+        document.getElementById('csrfToken').value = token;
+    } catch (err) {
+        console.error('CSRF Token Error:', err.message);
+        document.getElementById('tradeResult').innerText = 'Error initializing CSRF token: ' + err.message;
+    }
+}
+
+// Fetch Magic Eden Runes Prices
+async function fetchMagicEdenListings() {
+    const listingsDiv = document.getElementById('magic-eden-listings');
+    listingsDiv.innerHTML = 'Loading Magic Eden Runes Prices...';
+    try {
+        const response = await fetch('https://dcdollarcoin.u:3000/magic-eden/runes/prices', {
+            credentials: 'include'
+        });
+        if (!response.ok) throw new Error('Failed to fetch Magic Eden prices');
+        const data = await response.json();
+        listingsDiv.innerHTML = `Magic Eden Runes Prices:\n${JSON.stringify(data, null, 2)}`;
+    } catch (error) {
+        listingsDiv.innerHTML = `Error fetching Magic Eden prices: ${error.message}`;
+    }
+}
+
+// Fetch OKX BRC-20 Prices
+async function fetchOkxTrades() {
+    const tradesDiv = document.getElementById('okx-trades');
+    tradesDiv.innerHTML = 'Loading OKX BRC-20 Prices...';
+    try {
+        const response = await fetch('https://dcdollarcoin.u:3000/okx/brc20/prices', {
+            credentials: 'include'
+        });
+        if (!response.ok) throw new Error('Failed to fetch OKX prices');
+        const data = await response.json();
+        tradesDiv.innerHTML = `OKX BRC-20 Prices:\n${JSON.stringify(data, null, 2)}`;
+    } catch (error) {
+        tradesDiv.innerHTML = `Error fetching OKX prices: ${error.message}`;
+    }
+}
+
+// Fetch Prices
+async function fetchPrices() {
+    await Promise.all([fetchMagicEdenListings(), fetchOkxTrades()]);
+}
+
+// Handle Trade Form Submission
+document.getElementById('tradeForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    const resultBox = document.getElementById('tradeResult');
+    resultBox.innerText = 'Submitting trade...';
+
+    const data = {
+        tokenSymbol: sanitizeInput(form.tokenSymbol.value.trim()),
+        amount: parseInt(form.amount.value),
+        side: form.side.value,
+        address: sanitizeInput(form.address.value.trim()),
+        _csrf: form._csrf.value
+    };
+
+    if (!data.tokenSymbol || isNaN(data.amount) || data.amount <= 0) {
+        resultBox.innerText = 'Invalid input: Token symbol and amount are required, and amount must be positive.';
+        return;
+    }
+    if (!['buy', 'sell'].includes(data.side)) {
+        resultBox.innerText = 'Invalid side: Must be "buy" or "sell".';
+        return;
+    }
+    if (form.platform.value === 'magiceden' && !data.address) {
+        resultBox.innerText = 'Address is required for Magic Eden trades.';
+        return;
+    }
+
+    const platform = form.platform.value;
+    const endpoint = platform === 'okx' ? 'https://dcdollarcoin.u:3000/okx/trade' : 'https://dcdollarcoin.u:3000/magic-eden/runes/trade';
+
+    try {
+        const res = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify(data)
+        });
+
+        if (!res.ok) {
+            const errorData = await res.json();
+            throw new Error(errorData.error || 'Trade request failed');
+        }
+
+        const json = await res.json();
+        resultBox.innerText = JSON.stringify(json, null, 2);
+    } catch (err) {
+        console.error('Trade Error:', err.message);
+        resultBox.innerText = `Trade failed: ${err.message}`;
+    }
+});
+
+// WalletConnect Event Listeners
+document.getElementById('connectWalletBtn').addEventListener('click', connectWallet);
+document.getElementById('disconnectWalletBtn').addEventListener('click', disconnectWallet);
+
+// Initialize on Page Load
+window.onload = async () => {
+    await initializeWalletConnect();
+    await fetchCSRFToken();
+    await fetchPrices();
+};

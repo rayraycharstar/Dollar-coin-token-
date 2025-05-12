@@ -7,7 +7,7 @@ https://{
   "max": "21000000",
   "lim": "1000000",
   "dec": "8",
-  "image": "https://ipfs.io/ipfs/QmYourUniqueCID"
+  "image": DOLLAR•COIN•TOKEN(RUNES) DCTK(BRC-20) is my project I'm growing to be a Native-runes and brc-20 with ordinals ecosystem being one of very but most recent NATIVE American solo run builds. I'm creating this for my grandpa a WW2 vet and A.I.M member for my ancestors brother and sisters sons and daughters who all have grown up rugged and hungry "https://ipfs.io/ipfs/QmYourUniqueCID"
 }https://mempool.space/tx/9f61ce7625876f9807558da5be6b3598da912228a46c4f3f61d6915e0e773f33
 <p>DCTK isn’t just a BRC-20 token on the Bitcoin blockchain. It’s my legacy, a testament to a father’s love, and a promise to my kids that even in the darkest times, you can build something that lasts.</p>
 

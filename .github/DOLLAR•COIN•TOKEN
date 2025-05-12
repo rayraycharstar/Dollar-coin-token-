@@ -519,4 +519,4 @@ document.getElementById('tradeForm').addEventListener('submit', async (e) => {
 window.onload = () => {
     fetchCSRFToken();
     fetchPrices();
-};
+run};
